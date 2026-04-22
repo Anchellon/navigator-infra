@@ -1,5 +1,5 @@
 {
-  "app": "python3 app.py",
+  "app": ".venv\\Scripts\\python.exe app.py",
   "watch": {
     "include": [
       "**"
@@ -15,6 +15,11 @@
     ]
   },
   "context": {
+    "availability-zones:account=746669221991:region=us-east-1": [
+      "us-east-1a",
+      "us-east-1b",
+      "us-east-1c"
+    ],
     "@aws-cdk/aws-signer:signingProfileNamePassedToCfn": true,
     "@aws-cdk/aws-ecs-patterns:secGroupsDisablesImplicitOpenListener": true,
     "@aws-cdk/aws-lambda:recognizeLayerVersion": true,

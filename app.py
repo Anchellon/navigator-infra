@@ -1,28 +1,47 @@
 #!/usr/bin/env python3
-import os
-
 import aws_cdk as cdk
 
-from shelter_infra.shelter_infra_stack import ShelterInfraStack
-
+from shelter_infra.database_stack import DatabaseStack
+from shelter_infra.mcp_stack import McpStack
+from shelter_infra.agent_stack import AgentStack
 
 app = cdk.App()
-ShelterInfraStack(app, "ShelterInfraStack",
-    # If you don't specify 'env', this stack will be environment-agnostic.
-    # Account/Region-dependent features and context lookups will not work,
-    # but a single synthesized template can be deployed anywhere.
 
-    # Uncomment the next line to specialize this stack for the AWS Account
-    # and Region that are implied by the current CLI configuration.
+env_us = cdk.Environment(account="746669221991", region="us-east-1")
 
-    #env=cdk.Environment(account=os.getenv('CDK_DEFAULT_ACCOUNT'), region=os.getenv('CDK_DEFAULT_REGION')),
+# CloudFront origin for each environment — fill in once you have the distribution domain
+FRONTEND_ORIGINS = {
+    "staging": "https://d1zasklq8zscch.cloudfront.net",
+    "prod":    "",   # e.g. "https://d5678efgh.cloudfront.net"
+}
 
-    # Uncomment the next line if you know exactly what Account and Region you
-    # want to deploy the stack to. */
+for env_name in ["staging", "prod"]:
+    label = env_name.capitalize()
 
-    #env=cdk.Environment(account='123456789012', region='us-east-1'),
-
-    # For more information, see https://docs.aws.amazon.com/cdk/latest/guide/environments.html
+    db_stack = DatabaseStack(app, f"Navigator-{label}-Database",
+        env_name=env_name,
+        env=env_us,
     )
+
+    mcp_stack = McpStack(app, f"Navigator-{label}-Mcp",
+        env_name=env_name,
+        vpc=db_stack.vpc,
+        db_instance=db_stack.db_instance,
+        db_secret=db_stack.db_secret,
+        env=env_us,
+    )
+    mcp_stack.add_dependency(db_stack)
+
+    agent_stack = AgentStack(app, f"Navigator-{label}-Agent",
+        env_name=env_name,
+        vpc=db_stack.vpc,
+        mcp_namespace=mcp_stack.namespace,
+        mcp_service=mcp_stack.cloud_map_service,
+        db_instance=db_stack.db_instance,
+        db_secret=db_stack.db_secret,
+        frontend_origin=FRONTEND_ORIGINS[env_name],
+        env=env_us,
+    )
+    agent_stack.add_dependency(mcp_stack)
 
 app.synth()
