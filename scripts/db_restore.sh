@@ -26,9 +26,11 @@ SECRET_ARN=$(echo "$STACK_OUTPUTS" | python3 -c \
 echo "    DB host:    $DB_HOST"
 echo "    Secret ARN: $SECRET_ARN"
 
-VPC_ID=$(aws ec2 describe-vpcs --region "$REGION" \
-  --filters "Name=tag:aws:cloudformation:stack-name,Values=Navigator-${LABEL}-Database" \
-  --query "Vpcs[0].VpcId" --output text)
+VPC_ID=$(aws cloudformation describe-stacks \
+  --stack-name "Navigator-${LABEL}-Network" \
+  --region "$REGION" \
+  --query "Stacks[0].Outputs[?OutputKey=='VpcId'].OutputValue" \
+  --output text)
 
 SUBNET_ID=$(aws ec2 describe-subnets --region "$REGION" \
   --filters "Name=vpc-id,Values=$VPC_ID" "Name=tag:Name,Values=*Public*" \

@@ -43,6 +43,12 @@ for env_name in ["staging", "prod"]:
     )
     mcp_stack.add_dependency(db_stack)
 
+    frontend_stack = FrontendStack(app, f"Navigator-{label}-Frontend",
+        env_name=env_name,
+        oidc_provider_arn=cicd_stack.oidc_provider_arn,
+        env=env_us,
+    )
+
     agent_stack = AgentStack(app, f"Navigator-{label}-Agent",
         env_name=env_name,
         vpc=network_stack.vpc,
@@ -51,6 +57,7 @@ for env_name in ["staging", "prod"]:
         db_instance=db_stack.db_instance,
         db_secret=db_stack.db_secret,
         chatapi_repo=cicd_stack.chatapi_repo,
+        frontend_origin=frontend_stack.frontend_url,
         env=env_us,
     )
     agent_stack.add_dependency(mcp_stack)
@@ -65,11 +72,5 @@ for env_name in ["staging", "prod"]:
         env=env_us,
     )
     ingestion_stack.add_dependency(db_stack)
-
-    frontend_stack = FrontendStack(app, f"Navigator-{label}-Frontend",
-        env_name=env_name,
-        oidc_provider_arn=cicd_stack.oidc_provider_arn,
-        env=env_us,
-    )
 
 app.synth()

@@ -55,7 +55,7 @@ class IngestionStack(Stack):
         # Outbound-only — task runs in public subnet with public IP, no NAT needed
         ingestion_sg = ec2.SecurityGroup(self, "IngestionSG",
             vpc=vpc,
-            description=f"Navigator {env_name} ingestion task — outbound to AWS APIs only",
+            description=f"Navigator {env_name} ingestion task - outbound to AWS APIs only",
             allow_all_outbound=True,
         )
 
@@ -74,6 +74,7 @@ class IngestionStack(Stack):
             ),
             essential=True,
             environment={
+                "PYTHONUNBUFFERED": "1",
                 "EMBEDDING_PROVIDER": "bedrock",
                 "EMBEDDING_MODEL": "amazon.titan-embed-text-v2:0",
                 "AWS_REGION": self.region,
@@ -106,7 +107,7 @@ class IngestionStack(Stack):
         rule = events.Rule(self, "NightlySchedule",
             rule_name=f"navigator-{env_name}-ingestion-nightly",
             schedule=events.Schedule.cron(hour="10", minute="0"),
-            description=f"Navigator {env_name} nightly ingestion pipeline — 2 AM PST / 3 AM PDT",
+            description=f"Navigator {env_name} nightly ingestion pipeline - 2 AM PST / 3 AM PDT",
         )
         rule.add_target(targets.EcsTask(
             cluster=cluster,
@@ -147,4 +148,12 @@ class IngestionStack(Stack):
         cdk.CfnOutput(self, "LastRunParamName",
             value=last_run_param.parameter_name,
             description=f"Navigator {env_name} SSM param tracking last successful ingestion",
+        )
+        cdk.CfnOutput(self, "TaskDefinitionArn",
+            value=task_def.task_definition_arn,
+            description=f"Navigator {env_name} ingestion ECS task definition ARN",
+        )
+        cdk.CfnOutput(self, "ClusterName",
+            value=cluster.cluster_name,
+            description=f"Navigator {env_name} ingestion ECS cluster name",
         )

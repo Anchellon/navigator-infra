@@ -1,33 +1,34 @@
 #!/usr/bin/env bash
-# Manually trigger the ingestion pipeline ECS task.
-# Usage: ./scripts/run_ingestion.sh staging
-#        ./scripts/run_ingestion.sh prod
+# Manually trigger the ingestion pipeline ECS task (first run or ad-hoc re-seed).
+# Usage: ./scripts/db_seed.sh staging
+#        ./scripts/db_seed.sh prod
 set -euo pipefail
 
 ENV=${1:-staging}
 LABEL="$(tr '[:lower:]' '[:upper:]' <<< ${ENV:0:1})${ENV:1}"
 REGION="us-east-1"
 
-echo "==> Fetching ingestion cluster and task definition for Navigator-${LABEL}-Ingestion..."
+echo "==> Fetching stack outputs for Navigator-${LABEL}-Ingestion..."
+INGESTION_OUTPUTS=$(aws cloudformation describe-stacks \
+  --stack-name "Navigator-${LABEL}-Ingestion" \
+  --region "$REGION" \
+  --query "Stacks[0].Outputs" \
+  --output json)
 
-CLUSTER="navigator-${ENV}-ingestion"
+TASK_DEF_ARN=$(echo "$INGESTION_OUTPUTS" | python3 -c \
+  "import sys,json; o={x['OutputKey']:x['OutputValue'] for x in json.load(sys.stdin)}; print(o['TaskDefinitionArn'])")
+CLUSTER=$(echo "$INGESTION_OUTPUTS" | python3 -c \
+  "import sys,json; o={x['OutputKey']:x['OutputValue'] for x in json.load(sys.stdin)}; print(o['ClusterName'])")
 
-TASK_DEF_ARN=$(aws ecs list-task-definitions --region "$REGION" \
-  --family-prefix "Navigator${LABEL}IngestionTaskDef" \
-  --sort DESC \
-  --query "taskDefinitionArns[0]" \
-  --output text)
-
-if [ -z "$TASK_DEF_ARN" ] || [ "$TASK_DEF_ARN" = "None" ]; then
-  echo "==> ERROR: No task definition found. Has Navigator-${LABEL}-Ingestion been deployed?"
-  exit 1
-fi
-
+echo "    Cluster:         $CLUSTER"
 echo "    Task definition: $TASK_DEF_ARN"
 
-VPC_ID=$(aws ec2 describe-vpcs --region "$REGION" \
-  --filters "Name=tag:aws:cloudformation:stack-name,Values=Navigator-${LABEL}-Network" \
-  --query "Vpcs[0].VpcId" --output text)
+echo "==> Fetching network config from Navigator-${LABEL}-Network..."
+VPC_ID=$(aws cloudformation describe-stacks \
+  --stack-name "Navigator-${LABEL}-Network" \
+  --region "$REGION" \
+  --query "Stacks[0].Outputs[?OutputKey=='VpcId'].OutputValue" \
+  --output text)
 
 SUBNET_ID=$(aws ec2 describe-subnets --region "$REGION" \
   --filters "Name=vpc-id,Values=$VPC_ID" "Name=tag:Name,Values=*Public*" \

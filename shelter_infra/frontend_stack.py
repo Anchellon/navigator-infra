@@ -83,6 +83,8 @@ class FrontendStack(Stack):
         bucket.grant_read_write(deploy_role)
         distribution.grant_create_invalidation(deploy_role)
 
+        self.frontend_url = f"https://{distribution.distribution_domain_name}"
+
         CfnOutput(self, "BucketName",
             value=bucket.bucket_name,
             description=f"Navigator {env_name} frontend S3 bucket name",

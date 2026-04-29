@@ -63,6 +63,16 @@ class CICDStack(Stack):
             )
             ecr_repo.grant_push(role)
 
+            if key in ("mcp", "chatapi"):
+                role.add_to_policy(iam.PolicyStatement(
+                    actions=["ecs:UpdateService"],
+                    resources=["*"],
+                ))
+                role.add_to_policy(iam.PolicyStatement(
+                    actions=["ssm:GetParameter"],
+                    resources=[f"arn:aws:ssm:{self.region}:{self.account}:parameter/navigator/*"],
+                ))
+
             cdk.CfnOutput(self, f"{key.capitalize()}RepoUri",
                 value=ecr_repo.repository_uri,
                 description=f"ECR repo URI for {github_repo}",

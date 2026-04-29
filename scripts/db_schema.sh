@@ -11,13 +11,22 @@ LABEL="$(tr '[:lower:]' '[:upper:]' <<< ${ENV:0:1})${ENV:1}"
 REGION="us-east-1"
 ACCOUNT="746669221991"
 S3_BUCKET="navigator-db-backups-${ACCOUNT}"
-S3_KEY="bootstrap/create_service_snapshot.sql"
+S3_KEY="bootstrap/schema.sql"
 SQL_FILE="$(dirname "$0")/../sql/create_service_snapshot.sql"
+SQL_FILE2="$(dirname "$0")/../sql/create_saved_services.sql"
+SQL_FILE3="$(dirname "$0")/../sql/create_conversation_summaries.sql"
+SQL_FILE4="$(dirname "$0")/../sql/create_referrals.sql"
+COMBINED_SQL=$(mktemp /tmp/navigator_schema_XXXXXX.sql)
 
-if [ ! -f "$SQL_FILE" ]; then
-  echo "==> ERROR: SQL file not found at $SQL_FILE"
-  exit 1
-fi
+for f in "$SQL_FILE" "$SQL_FILE2" "$SQL_FILE3" "$SQL_FILE4"; do
+  if [ ! -f "$f" ]; then
+    echo "==> ERROR: SQL file not found at $f"
+    exit 1
+  fi
+done
+
+# Combine into a single file so all tables are created in one psql run
+cat "$SQL_FILE" "$SQL_FILE2" "$SQL_FILE3" "$SQL_FILE4" > "$COMBINED_SQL"
 
 echo "==> Fetching stack outputs for Navigator-${LABEL}-Database..."
 STACK_OUTPUTS=$(aws cloudformation describe-stacks \
@@ -34,9 +43,11 @@ SECRET_ARN=$(echo "$STACK_OUTPUTS" | python3 -c \
 echo "    DB host:    $DB_HOST"
 echo "    Secret ARN: $SECRET_ARN"
 
-VPC_ID=$(aws ec2 describe-vpcs --region "$REGION" \
-  --filters "Name=tag:aws:cloudformation:stack-name,Values=Navigator-${LABEL}-Network" \
-  --query "Vpcs[0].VpcId" --output text)
+VPC_ID=$(aws cloudformation describe-stacks \
+  --stack-name "Navigator-${LABEL}-Network" \
+  --region "$REGION" \
+  --query "Stacks[0].Outputs[?OutputKey=='VpcId'].OutputValue" \
+  --output text)
 
 SUBNET_ID=$(aws ec2 describe-subnets --region "$REGION" \
   --filters "Name=vpc-id,Values=$VPC_ID" "Name=tag:Name,Values=*Public*" \
@@ -52,8 +63,8 @@ SECRET_JSON=$(aws secretsmanager get-secret-value \
 DB_USER=$(echo "$SECRET_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['username'])")
 DB_PASS=$(echo "$SECRET_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['password'])")
 
-echo "==> Uploading SQL to S3..."
-aws s3 cp "$SQL_FILE" "s3://${S3_BUCKET}/${S3_KEY}" --region "$REGION"
+echo "==> Uploading combined schema SQL to S3..."
+aws s3 cp "$COMBINED_SQL" "s3://${S3_BUCKET}/${S3_KEY}" --region "$REGION"
 
 echo "==> Generating presigned S3 URL..."
 SQL_URL=$(aws s3 presign "s3://${S3_BUCKET}/${S3_KEY}" --expires-in 3600 --region "$REGION")
@@ -85,6 +96,7 @@ TASK_DEF_ARN=""
 
 cleanup() {
   echo "==> Cleaning up temporary resources..."
+  rm -f "$COMBINED_SQL"
   aws s3 rm "s3://${S3_BUCKET}/${S3_KEY}" --region "$REGION" 2>/dev/null || true
   aws ec2 revoke-security-group-ingress --region "$REGION" \
     --group-id "$DB_SG" --protocol tcp --port 5432 \

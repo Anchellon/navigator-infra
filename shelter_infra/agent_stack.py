@@ -1,3 +1,4 @@
+import aws_cdk as cdk
 from aws_cdk import (
     CfnOutput,
     Stack,
@@ -10,6 +11,7 @@ from aws_cdk import (
     aws_rds as rds,
     aws_secretsmanager as secretsmanager,
     aws_servicediscovery as servicediscovery,
+    aws_ssm as ssm,
 )
 from constructs import Construct
 
@@ -142,6 +144,17 @@ class AgentStack(Stack):
                 cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
                 origin_request_policy=cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
             ),
+            # HTTP/1.1 required — SSE streams break over HTTP/2 via CloudFront
+            http_version=cloudfront.HttpVersion.HTTP1_1,
+        )
+
+        ssm.StringParameter(self, "ClusterNameParam",
+            parameter_name=f"/navigator/{env_name}/agent/cluster-name",
+            string_value=cluster.cluster_name,
+        )
+        ssm.StringParameter(self, "ServiceNameParam",
+            parameter_name=f"/navigator/{env_name}/agent/service-name",
+            string_value=agent_service.service_name,
         )
 
         CfnOutput(self, "AgentUrl",

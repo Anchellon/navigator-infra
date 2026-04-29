@@ -1,3 +1,4 @@
+import aws_cdk as cdk
 from aws_cdk import (
     Stack,
     aws_ec2 as ec2,
@@ -7,6 +8,7 @@ from aws_cdk import (
     aws_rds as rds,
     aws_secretsmanager as secretsmanager,
     aws_servicediscovery as servicediscovery,
+    aws_ssm as ssm,
 )
 from constructs import Construct
 
@@ -100,3 +102,12 @@ class McpStack(Stack):
         scaling.scale_on_memory_utilization("MemoryScaling", target_utilization_percent=70)
 
         self.cloud_map_service = mcp_service.cloud_map_service
+
+        ssm.StringParameter(self, "ClusterNameParam",
+            parameter_name=f"/navigator/{env_name}/mcp/cluster-name",
+            string_value=cluster.cluster_name,
+        )
+        ssm.StringParameter(self, "ServiceNameParam",
+            parameter_name=f"/navigator/{env_name}/mcp/service-name",
+            string_value=mcp_service.service_name,
+        )
