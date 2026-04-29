@@ -56,3 +56,11 @@ command.
  * `cdk docs`        open CDK documentation
 
 Enjoy!
+
+## TODO
+
+- [ ] Prod stacks — deploy with `env_name=prod`, wire separate GitHub secrets/SSM params per env
+- [ ] ALB idle timeout — increase from 60s default (slow MCP searches can exceed this)
+- [ ] Parallel embeddings in ingestion — ThreadPoolExecutor (~10x speedup on nightly runs)
+- [ ] SSE keepalive events in chat API — prevent ALB/CloudFront timeout on slow searches
+- [ ] Split GitHub OIDC roles to env-level for backend repos (currently staging-only, shared role)
