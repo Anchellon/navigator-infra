@@ -1,11 +1,10 @@
-from pathlib import Path
-
 from aws_cdk import (
     CfnOutput,
     Stack,
     aws_cloudfront as cloudfront,
     aws_cloudfront_origins as origins,
     aws_ec2 as ec2,
+    aws_ecr as ecr,
     aws_ecs as ecs,
     aws_elasticloadbalancingv2 as elbv2,
     aws_rds as rds,
@@ -13,9 +12,6 @@ from aws_cdk import (
     aws_servicediscovery as servicediscovery,
 )
 from constructs import Construct
-
-_ROOT = Path(__file__).parent.parent
-AGENT_DIR = str(_ROOT.parent / "shelter-chat-api")
 
 
 class AgentStack(Stack):
@@ -29,12 +25,13 @@ class AgentStack(Stack):
         mcp_service,
         db_instance: rds.DatabaseInstance,
         db_secret: secretsmanager.ISecret,
+        chatapi_repo: ecr.Repository,
         frontend_origin: str = "",
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        agent_image = ecs.ContainerImage.from_asset(AGENT_DIR)
+        agent_image = ecs.ContainerImage.from_ecr_repository(chatapi_repo)
 
         # Must be pre-created: aws secretsmanager create-secret \
         #   --name navigator/{env_name}/anthropic-api-key \
@@ -88,6 +85,7 @@ class AgentStack(Stack):
             },
         )
 
+        chatapi_repo.grant_pull(task_def.execution_role)
         anthropic_secret.grant_read(task_def.task_role)
         db_secret.grant_read(task_def.task_role)
 

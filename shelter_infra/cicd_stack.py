@@ -25,6 +25,8 @@ class CICDStack(Stack):
             thumbprints=["6938fd4d98bab03faadb97b34396831e3780aea1"],
         )
 
+        self.oidc_provider_arn = oidc_provider.open_id_connect_provider_arn
+
         self.mcp_repo = ecr.Repository(self, "McpRepo",
             repository_name="mcp-server",
             removal_policy=cdk.RemovalPolicy.RETAIN,
