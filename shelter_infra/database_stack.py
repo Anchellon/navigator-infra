@@ -8,33 +8,16 @@ from constructs import Construct
 
 
 class DatabaseStack(Stack):
-    def __init__(self, scope: Construct, construct_id: str, env_name: str, **kwargs) -> None:
+    def __init__(self, scope: Construct, construct_id: str, env_name: str, vpc: ec2.Vpc, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        self.vpc = ec2.Vpc(self, "Vpc",
-            max_azs=2,
-            nat_gateways=0,
-            subnet_configuration=[
-                ec2.SubnetConfiguration(
-                    name="Public",
-                    subnet_type=ec2.SubnetType.PUBLIC,
-                    cidr_mask=24,
-                ),
-                ec2.SubnetConfiguration(
-                    name="Isolated",
-                    subnet_type=ec2.SubnetType.PRIVATE_ISOLATED,
-                    cidr_mask=24,
-                ),
-            ],
-        )
-
         db_sg = ec2.SecurityGroup(self, "DatabaseSG",
-            vpc=self.vpc,
+            vpc=vpc,
             description=f"Navigator {env_name} RDS security group",
             allow_all_outbound=False,
         )
         db_sg.add_ingress_rule(
-            ec2.Peer.ipv4(self.vpc.vpc_cidr_block),
+            ec2.Peer.ipv4(vpc.vpc_cidr_block),
             ec2.Port.tcp(5432),
             "Allow PostgreSQL from within VPC",
         )
@@ -49,7 +32,7 @@ class DatabaseStack(Stack):
                 version=rds.PostgresEngineVersion.VER_16,
             ),
             instance_type=ec2.InstanceType.of(ec2.InstanceClass.T3, instance_size),
-            vpc=self.vpc,
+            vpc=vpc,
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
             security_groups=[db_sg],
             database_name="shelter",

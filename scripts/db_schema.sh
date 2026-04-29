@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# One-time DB restore from S3.
-# Usage: ./scripts/restore_db.sh staging
-#        ./scripts/restore_db.sh prod
+# One-time DB bootstrap — creates service_snapshots table + pgvector extension.
+# Run this after restore_db.sh, before the first ingestion pipeline run.
+#
+# Usage: ./scripts/bootstrap_db.sh staging
+#        ./scripts/bootstrap_db.sh prod
 set -euo pipefail
 
 ENV=${1:-staging}
@@ -9,7 +11,22 @@ LABEL="$(tr '[:lower:]' '[:upper:]' <<< ${ENV:0:1})${ENV:1}"
 REGION="us-east-1"
 ACCOUNT="746669221991"
 S3_BUCKET="navigator-db-backups-${ACCOUNT}"
-S3_KEY="shelter_tech_dump.sql"
+S3_KEY="bootstrap/schema.sql"
+SQL_FILE="$(dirname "$0")/../sql/create_service_snapshot.sql"
+SQL_FILE2="$(dirname "$0")/../sql/create_saved_services.sql"
+SQL_FILE3="$(dirname "$0")/../sql/create_conversation_summaries.sql"
+SQL_FILE4="$(dirname "$0")/../sql/create_referrals.sql"
+COMBINED_SQL=$(mktemp /tmp/navigator_schema_XXXXXX.sql)
+
+for f in "$SQL_FILE" "$SQL_FILE2" "$SQL_FILE3" "$SQL_FILE4"; do
+  if [ ! -f "$f" ]; then
+    echo "==> ERROR: SQL file not found at $f"
+    exit 1
+  fi
+done
+
+# Combine into a single file so all tables are created in one psql run
+cat "$SQL_FILE" "$SQL_FILE2" "$SQL_FILE3" "$SQL_FILE4" > "$COMBINED_SQL"
 
 echo "==> Fetching stack outputs for Navigator-${LABEL}-Database..."
 STACK_OUTPUTS=$(aws cloudformation describe-stacks \
@@ -26,9 +43,11 @@ SECRET_ARN=$(echo "$STACK_OUTPUTS" | python3 -c \
 echo "    DB host:    $DB_HOST"
 echo "    Secret ARN: $SECRET_ARN"
 
-VPC_ID=$(aws ec2 describe-vpcs --region "$REGION" \
-  --filters "Name=tag:aws:cloudformation:stack-name,Values=Navigator-${LABEL}-Database" \
-  --query "Vpcs[0].VpcId" --output text)
+VPC_ID=$(aws cloudformation describe-stacks \
+  --stack-name "Navigator-${LABEL}-Network" \
+  --region "$REGION" \
+  --query "Stacks[0].Outputs[?OutputKey=='VpcId'].OutputValue" \
+  --output text)
 
 SUBNET_ID=$(aws ec2 describe-subnets --region "$REGION" \
   --filters "Name=vpc-id,Values=$VPC_ID" "Name=tag:Name,Values=*Public*" \
@@ -37,7 +56,6 @@ SUBNET_ID=$(aws ec2 describe-subnets --region "$REGION" \
 echo "    VPC:    $VPC_ID"
 echo "    Subnet: $SUBNET_ID"
 
-# Fetch DB credentials here, not inside the container — avoids needing aws-cli in the image
 echo "==> Fetching DB credentials from Secrets Manager..."
 SECRET_JSON=$(aws secretsmanager get-secret-value \
   --secret-id "$SECRET_ARN" --region "$REGION" \
@@ -45,19 +63,19 @@ SECRET_JSON=$(aws secretsmanager get-secret-value \
 DB_USER=$(echo "$SECRET_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['username'])")
 DB_PASS=$(echo "$SECRET_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['password'])")
 
-# Presign the S3 URL (1hr TTL) so the container can wget it without any IAM setup
-echo "==> Generating presigned S3 URL..."
-DUMP_URL=$(aws s3 presign "s3://${S3_BUCKET}/${S3_KEY}" --expires-in 3600 --region "$REGION")
+echo "==> Uploading combined schema SQL to S3..."
+aws s3 cp "$COMBINED_SQL" "s3://${S3_BUCKET}/${S3_KEY}" --region "$REGION"
 
-# Temporary security group for the ECS task
+echo "==> Generating presigned S3 URL..."
+SQL_URL=$(aws s3 presign "s3://${S3_BUCKET}/${S3_KEY}" --expires-in 3600 --region "$REGION")
+
 echo "==> Creating temporary security group..."
-RESTORE_SG=$(aws ec2 create-security-group --region "$REGION" \
-  --group-name "navigator-${ENV}-restore-$$" \
-  --description "Temp SG for DB restore" \
+BOOTSTRAP_SG=$(aws ec2 create-security-group --region "$REGION" \
+  --group-name "navigator-${ENV}-bootstrap-$$" \
+  --description "Temp SG for DB bootstrap" \
   --vpc-id "$VPC_ID" \
   --query "GroupId" --output text)
 
-# Add a scoped ingress rule to the DB SG from the restore task's SG
 DB_SG=$(aws ec2 describe-security-groups --region "$REGION" \
   --filters \
     "Name=vpc-id,Values=$VPC_ID" \
@@ -67,22 +85,24 @@ DB_SG=$(aws ec2 describe-security-groups --region "$REGION" \
 aws ec2 authorize-security-group-ingress --region "$REGION" \
   --group-id "$DB_SG" \
   --protocol tcp --port 5432 \
-  --source-group "$RESTORE_SG"
+  --source-group "$BOOTSTRAP_SG"
 
-echo "    Restore SG: $RESTORE_SG"
-echo "    DB SG:      $DB_SG  (temporary ingress rule added)"
+echo "    Bootstrap SG: $BOOTSTRAP_SG"
+echo "    DB SG:        $DB_SG (temporary ingress rule added)"
 
-ROLE_NAME="navigator-${ENV}-restore-$$"
-TEMP_CLUSTER="navigator-${ENV}-restore-$$"
+ROLE_NAME="navigator-${ENV}-bootstrap-$$"
+TEMP_CLUSTER="navigator-${ENV}-bootstrap-$$"
 TASK_DEF_ARN=""
 
 cleanup() {
   echo "==> Cleaning up temporary resources..."
+  rm -f "$COMBINED_SQL"
+  aws s3 rm "s3://${S3_BUCKET}/${S3_KEY}" --region "$REGION" 2>/dev/null || true
   aws ec2 revoke-security-group-ingress --region "$REGION" \
     --group-id "$DB_SG" --protocol tcp --port 5432 \
-    --source-group "$RESTORE_SG" 2>/dev/null || true
+    --source-group "$BOOTSTRAP_SG" 2>/dev/null || true
   aws ec2 delete-security-group --region "$REGION" \
-    --group-id "$RESTORE_SG" 2>/dev/null || true
+    --group-id "$BOOTSTRAP_SG" 2>/dev/null || true
   [ -n "$TASK_DEF_ARN" ] && \
     aws ecs deregister-task-definition --region "$REGION" \
       --task-definition "$TASK_DEF_ARN" > /dev/null 2>/dev/null || true
@@ -96,7 +116,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Dedicated cluster so we don't depend on any existing stack being deployed
 aws ecs create-cluster --region "$REGION" --cluster-name "$TEMP_CLUSTER" > /dev/null
 
 echo "==> Creating IAM role..."
@@ -117,33 +136,32 @@ echo "==> Waiting for IAM propagation..."
 sleep 15
 
 aws logs create-log-group \
-  --log-group-name "/ecs/navigator-${ENV}-restore" \
+  --log-group-name "/ecs/navigator-${ENV}-bootstrap" \
   --region "$REGION" 2>/dev/null || true
 
-# Build container JSON via Python to safely escape the password and presigned URL
-CONTAINER_DEFS=$(python3 - "$DB_PASS" "$DUMP_URL" "$DB_HOST" "$DB_USER" "$ENV" "$REGION" <<'PYEOF'
+CONTAINER_DEFS=$(python3 - "$DB_PASS" "$SQL_URL" "$DB_HOST" "$DB_USER" "$ENV" "$REGION" <<'PYEOF'
 import json, sys
-db_pass, dump_url, db_host, db_user, env, region = sys.argv[1:]
+db_pass, sql_url, db_host, db_user, env, region = sys.argv[1:]
 print(json.dumps([{
-    "name": "restore",
+    "name": "bootstrap",
     "image": "postgres:16-alpine",
     "essential": True,
     "command": [
         "sh", "-c",
-        'wget -qO- "$DUMP_URL" | psql -h "$DB_HOST" -U "$DB_USER" -d shelter'
+        'wget -qO- "$SQL_URL" | psql -h "$DB_HOST" -U "$DB_USER" -d shelter'
     ],
     "environment": [
         {"name": "PGPASSWORD", "value": db_pass},
-        {"name": "DUMP_URL",   "value": dump_url},
+        {"name": "SQL_URL",    "value": sql_url},
         {"name": "DB_HOST",    "value": db_host},
         {"name": "DB_USER",    "value": db_user},
     ],
     "logConfiguration": {
         "logDriver": "awslogs",
         "options": {
-            "awslogs-group":         f"/ecs/navigator-{env}-restore",
+            "awslogs-group":         f"/ecs/navigator-{env}-bootstrap",
             "awslogs-region":        region,
-            "awslogs-stream-prefix": "restore",
+            "awslogs-stream-prefix": "bootstrap",
         }
     }
 }]))
@@ -152,7 +170,7 @@ PYEOF
 
 echo "==> Registering task definition..."
 TASK_DEF_ARN=$(aws ecs register-task-definition --region "$REGION" \
-  --family "navigator-${ENV}-db-restore" \
+  --family "navigator-${ENV}-db-bootstrap" \
   --network-mode awsvpc \
   --requires-compatibilities FARGATE \
   --cpu "512" --memory "1024" \
@@ -161,13 +179,13 @@ TASK_DEF_ARN=$(aws ecs register-task-definition --region "$REGION" \
   --container-definitions "$CONTAINER_DEFS" \
   --query "taskDefinition.taskDefinitionArn" --output text)
 
-echo "==> Running restore task..."
+echo "==> Running bootstrap task..."
 RUN_OUT=$(aws ecs run-task --region "$REGION" \
   --cluster "$TEMP_CLUSTER" \
   --task-definition "$TASK_DEF_ARN" \
   --launch-type FARGATE \
   --network-configuration \
-    "awsvpcConfiguration={subnets=[$SUBNET_ID],securityGroups=[$RESTORE_SG],assignPublicIp=ENABLED}" \
+    "awsvpcConfiguration={subnets=[$SUBNET_ID],securityGroups=[$BOOTSTRAP_SG],assignPublicIp=ENABLED}" \
   --output json)
 
 TASK_ARN=$(echo "$RUN_OUT" | python3 -c \
@@ -181,7 +199,7 @@ if [ -z "$TASK_ARN" ]; then
 fi
 
 echo "    Task: $TASK_ARN"
-echo "==> Waiting for restore to complete (this may take a few minutes)..."
+echo "==> Waiting for bootstrap to complete..."
 aws ecs wait tasks-stopped --region "$REGION" --cluster "$TEMP_CLUSTER" --tasks "$TASK_ARN"
 
 EXIT_CODE=$(aws ecs describe-tasks --region "$REGION" \
@@ -189,9 +207,10 @@ EXIT_CODE=$(aws ecs describe-tasks --region "$REGION" \
   --query "tasks[0].containers[0].exitCode" --output text)
 
 if [ "$EXIT_CODE" = "0" ]; then
-  echo "==> Restore completed successfully."
+  echo "==> Bootstrap completed successfully."
+  echo "    service_snapshots table is ready — run the ingestion pipeline to populate it."
 else
-  echo "==> Restore FAILED (exit code: $EXIT_CODE)."
-  echo "    Stream logs with: aws logs tail /ecs/navigator-${ENV}-restore --region $REGION --follow"
+  echo "==> Bootstrap FAILED (exit code: $EXIT_CODE)."
+  echo "    Stream logs with: aws logs tail /ecs/navigator-${ENV}-bootstrap --region $REGION --follow"
   exit 1
 fi

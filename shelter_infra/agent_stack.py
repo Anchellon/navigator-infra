@@ -1,21 +1,19 @@
-from pathlib import Path
-
+import aws_cdk as cdk
 from aws_cdk import (
     CfnOutput,
     Stack,
     aws_cloudfront as cloudfront,
     aws_cloudfront_origins as origins,
     aws_ec2 as ec2,
+    aws_ecr as ecr,
     aws_ecs as ecs,
     aws_elasticloadbalancingv2 as elbv2,
     aws_rds as rds,
     aws_secretsmanager as secretsmanager,
     aws_servicediscovery as servicediscovery,
+    aws_ssm as ssm,
 )
 from constructs import Construct
-
-_ROOT = Path(__file__).parent.parent
-AGENT_DIR = str(_ROOT.parent / "shelter-chat-api")
 
 
 class AgentStack(Stack):
@@ -29,12 +27,13 @@ class AgentStack(Stack):
         mcp_service,
         db_instance: rds.DatabaseInstance,
         db_secret: secretsmanager.ISecret,
+        chatapi_repo: ecr.Repository,
         frontend_origin: str = "",
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        agent_image = ecs.ContainerImage.from_asset(AGENT_DIR)
+        agent_image = ecs.ContainerImage.from_ecr_repository(chatapi_repo)
 
         # Must be pre-created: aws secretsmanager create-secret \
         #   --name navigator/{env_name}/anthropic-api-key \
@@ -88,6 +87,7 @@ class AgentStack(Stack):
             },
         )
 
+        chatapi_repo.grant_pull(task_def.execution_role)
         anthropic_secret.grant_read(task_def.task_role)
         db_secret.grant_read(task_def.task_role)
 
@@ -144,6 +144,17 @@ class AgentStack(Stack):
                 cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
                 origin_request_policy=cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
             ),
+            # HTTP/1.1 required — SSE streams break over HTTP/2 via CloudFront
+            http_version=cloudfront.HttpVersion.HTTP1_1,
+        )
+
+        ssm.StringParameter(self, "ClusterNameParam",
+            parameter_name=f"/navigator/{env_name}/agent/cluster-name",
+            string_value=cluster.cluster_name,
+        )
+        ssm.StringParameter(self, "ServiceNameParam",
+            parameter_name=f"/navigator/{env_name}/agent/service-name",
+            string_value=agent_service.service_name,
         )
 
         CfnOutput(self, "AgentUrl",

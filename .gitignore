@@ -8,3 +8,7 @@ __pycache__
 # CDK asset staging directory
 .cdk.staging
 cdk.out
+
+# Database dumps — never commit these
+*.sql.gz
+shelter_tech_dump.sql
