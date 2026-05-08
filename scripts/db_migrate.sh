@@ -1,46 +1,72 @@
 #!/usr/bin/env bash
-# DEPRECATED — DO NOT USE FOR NEW WORK.
+# Run Flyway migrations against the Navigator RDS Postgres database.
+# Spins up a one-off Fargate task using the flyway/flyway image, then tears
+# down all temporary infra (cluster, task def, IAM role, security group rule).
 #
-# Schema is now managed by Flyway via scripts/db_migrate.sh. Use that for any
-# schema changes (new tables, ALTERs, indexes, etc). Flyway tracks applied
-# versions in the flyway_schema_history table so re-runs are safe and only
-# apply pending migrations.
+# Migrations live in sql/migrations/ and follow Flyway's V<n>__<desc>.sql convention.
+# Flyway tracks applied versions in the flyway_schema_history table — re-runs
+# only apply new migrations.
 #
-# This script is kept temporarily as a fallback while the Flyway pipeline is
-# being validated. It will be removed once db_migrate.sh is proven on staging
-# and prod. Do NOT run this against a Flyway-managed database — the raw
-# CREATE TABLE statements will conflict and the two tools will disagree about
-# what the schema is.
-#
-# ----------------------------------------------------------------------------
-# One-time DB bootstrap — creates service_snapshots table + pgvector extension.
-# Run this after restore_db.sh, before the first ingestion pipeline run.
-#
-# Usage: ./scripts/bootstrap_db.sh staging
-#        ./scripts/bootstrap_db.sh prod
+# Usage:
+#   ./scripts/db_migrate.sh staging                     # run pending migrations
+#   ./scripts/db_migrate.sh prod
+#   ./scripts/db_migrate.sh staging --baseline 4        # mark V1..V4 as already
+#                                                       # applied (one-time op for
+#                                                       # DBs bootstrapped via the
+#                                                       # legacy db_schema.sh)
+#   ./scripts/db_migrate.sh staging --info              # show migration state
+#                                                       # (applied / pending / failed)
+#   ./scripts/db_migrate.sh staging --validate          # checksum-validate applied
+#                                                       # migrations against the files
 set -euo pipefail
 
 ENV=${1:-staging}
+shift || true
+
+FLYWAY_CMD="migrate"
+case "${1:-}" in
+  --baseline)
+    BASELINE_VERSION="${2:-}"
+    if [ -z "$BASELINE_VERSION" ]; then
+      echo "ERROR: --baseline requires a version number (e.g. --baseline 4)"
+      exit 1
+    fi
+    FLYWAY_CMD="baseline -baselineVersion=$BASELINE_VERSION"
+    ;;
+  --info)
+    FLYWAY_CMD="info"
+    ;;
+  --validate)
+    FLYWAY_CMD="validate"
+    ;;
+  "")
+    ;;
+  *)
+    echo "ERROR: unknown flag '$1' (supported: --baseline N, --info, --validate)"
+    exit 1
+    ;;
+esac
+
 LABEL="$(tr '[:lower:]' '[:upper:]' <<< ${ENV:0:1})${ENV:1}"
 REGION="us-east-1"
 ACCOUNT="746669221991"
 S3_BUCKET="navigator-db-backups-${ACCOUNT}"
-S3_KEY="bootstrap/schema.sql"
-SQL_FILE="$(dirname "$0")/../sql/create_service_snapshot.sql"
-SQL_FILE2="$(dirname "$0")/../sql/create_saved_services.sql"
-SQL_FILE3="$(dirname "$0")/../sql/create_conversation_summaries.sql"
-SQL_FILE4="$(dirname "$0")/../sql/create_referrals.sql"
-COMBINED_SQL=$(mktemp /tmp/navigator_schema_XXXXXX.sql)
+S3_KEY="migrate/migrations-$$.tgz"
+MIGRATIONS_DIR="$(dirname "$0")/../sql/migrations"
+TARBALL=$(mktemp /tmp/navigator_migrations_XXXXXX.tgz)
 
-for f in "$SQL_FILE" "$SQL_FILE2" "$SQL_FILE3" "$SQL_FILE4"; do
-  if [ ! -f "$f" ]; then
-    echo "==> ERROR: SQL file not found at $f"
-    exit 1
-  fi
-done
+if [ ! -d "$MIGRATIONS_DIR" ]; then
+  echo "==> ERROR: migrations dir not found at $MIGRATIONS_DIR"
+  exit 1
+fi
+if [ -z "$(ls "$MIGRATIONS_DIR"/V*.sql 2>/dev/null)" ]; then
+  echo "==> ERROR: no V*.sql files found in $MIGRATIONS_DIR"
+  exit 1
+fi
 
-# Combine into a single file so all tables are created in one psql run
-cat "$SQL_FILE" "$SQL_FILE2" "$SQL_FILE3" "$SQL_FILE4" > "$COMBINED_SQL"
+echo "==> Bundling migrations from $MIGRATIONS_DIR"
+tar -czf "$TARBALL" -C "$MIGRATIONS_DIR" .
+echo "    $(tar -tzf "$TARBALL" | grep -c '\.sql$') migration file(s) bundled"
 
 echo "==> Fetching stack outputs for Navigator-${LABEL}-Database..."
 STACK_OUTPUTS=$(aws cloudformation describe-stacks \
@@ -56,6 +82,7 @@ SECRET_ARN=$(echo "$STACK_OUTPUTS" | python3 -c \
 
 echo "    DB host:    $DB_HOST"
 echo "    Secret ARN: $SECRET_ARN"
+echo "    Command:    $FLYWAY_CMD"
 
 VPC_ID=$(aws cloudformation describe-stacks \
   --stack-name "Navigator-${LABEL}-Network" \
@@ -77,16 +104,16 @@ SECRET_JSON=$(aws secretsmanager get-secret-value \
 DB_USER=$(echo "$SECRET_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['username'])")
 DB_PASS=$(echo "$SECRET_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['password'])")
 
-echo "==> Uploading combined schema SQL to S3..."
-aws s3 cp "$COMBINED_SQL" "s3://${S3_BUCKET}/${S3_KEY}" --region "$REGION"
+echo "==> Uploading migrations tarball to S3..."
+aws s3 cp "$TARBALL" "s3://${S3_BUCKET}/${S3_KEY}" --region "$REGION"
 
 echo "==> Generating presigned S3 URL..."
 SQL_URL=$(aws s3 presign "s3://${S3_BUCKET}/${S3_KEY}" --expires-in 3600 --region "$REGION")
 
 echo "==> Creating temporary security group..."
-BOOTSTRAP_SG=$(aws ec2 create-security-group --region "$REGION" \
-  --group-name "navigator-${ENV}-bootstrap-$$" \
-  --description "Temp SG for DB bootstrap" \
+MIGRATE_SG=$(aws ec2 create-security-group --region "$REGION" \
+  --group-name "navigator-${ENV}-migrate-$$" \
+  --description "Temp SG for Flyway migrate" \
   --vpc-id "$VPC_ID" \
   --query "GroupId" --output text)
 
@@ -99,24 +126,24 @@ DB_SG=$(aws ec2 describe-security-groups --region "$REGION" \
 aws ec2 authorize-security-group-ingress --region "$REGION" \
   --group-id "$DB_SG" \
   --protocol tcp --port 5432 \
-  --source-group "$BOOTSTRAP_SG"
+  --source-group "$MIGRATE_SG"
 
-echo "    Bootstrap SG: $BOOTSTRAP_SG"
-echo "    DB SG:        $DB_SG (temporary ingress rule added)"
+echo "    Migrate SG: $MIGRATE_SG"
+echo "    DB SG:      $DB_SG (temporary ingress rule added)"
 
-ROLE_NAME="navigator-${ENV}-bootstrap-$$"
-TEMP_CLUSTER="navigator-${ENV}-bootstrap-$$"
+ROLE_NAME="navigator-${ENV}-migrate-$$"
+TEMP_CLUSTER="navigator-${ENV}-migrate-$$"
 TASK_DEF_ARN=""
 
 cleanup() {
   echo "==> Cleaning up temporary resources..."
-  rm -f "$COMBINED_SQL"
+  rm -f "$TARBALL"
   aws s3 rm "s3://${S3_BUCKET}/${S3_KEY}" --region "$REGION" 2>/dev/null || true
   aws ec2 revoke-security-group-ingress --region "$REGION" \
     --group-id "$DB_SG" --protocol tcp --port 5432 \
-    --source-group "$BOOTSTRAP_SG" 2>/dev/null || true
+    --source-group "$MIGRATE_SG" 2>/dev/null || true
   aws ec2 delete-security-group --region "$REGION" \
-    --group-id "$BOOTSTRAP_SG" 2>/dev/null || true
+    --group-id "$MIGRATE_SG" 2>/dev/null || true
   [ -n "$TASK_DEF_ARN" ] && \
     aws ecs deregister-task-definition --region "$REGION" \
       --task-definition "$TASK_DEF_ARN" > /dev/null 2>/dev/null || true
@@ -150,32 +177,48 @@ echo "==> Waiting for IAM propagation..."
 sleep 15
 
 aws logs create-log-group \
-  --log-group-name "/ecs/navigator-${ENV}-bootstrap" \
+  --log-group-name "/ecs/navigator-${ENV}-migrate" \
   --region "$REGION" 2>/dev/null || true
 
-CONTAINER_DEFS=$(python3 - "$DB_PASS" "$SQL_URL" "$DB_HOST" "$DB_USER" "$ENV" "$REGION" <<'PYEOF'
+# Container shell:
+#   1. download migrations tarball from S3 presigned URL
+#   2. extract into /flyway/sql (Flyway's default locations dir)
+#   3. log the files that landed (helps debug "wrong migrations bundled" issues)
+#   4. invoke Flyway with the chosen subcommand against the 'shelter' database
+CONTAINER_DEFS=$(python3 - "$DB_PASS" "$SQL_URL" "$DB_HOST" "$DB_USER" "$ENV" "$REGION" "$FLYWAY_CMD" <<'PYEOF'
 import json, sys
-db_pass, sql_url, db_host, db_user, env, region = sys.argv[1:]
+db_pass, sql_url, db_host, db_user, env, region, flyway_cmd = sys.argv[1:]
+shell = (
+    'set -e; '
+    'mkdir -p /flyway/sql && '
+    'wget -qO /tmp/m.tgz "$SQL_URL" && '
+    'tar -xzf /tmp/m.tgz -C /flyway/sql && '
+    'echo "Migrations on disk:" && ls -1 /flyway/sql && '
+    '/flyway/flyway '
+    '-url="jdbc:postgresql://$DB_HOST:5432/shelter" '
+    '-user="$DB_USER" -password="$FLYWAY_PASSWORD" '
+    '-locations=filesystem:/flyway/sql '
+    '-connectRetries=10 '
+    f'{flyway_cmd}'
+)
 print(json.dumps([{
-    "name": "bootstrap",
-    "image": "postgres:16-alpine",
+    "name": "flyway",
+    "image": "flyway/flyway:10-alpine",
     "essential": True,
-    "command": [
-        "sh", "-c",
-        'wget -qO- "$SQL_URL" | psql -h "$DB_HOST" -U "$DB_USER" -d shelter'
-    ],
+    "entryPoint": ["/bin/sh", "-c"],
+    "command": [shell],
     "environment": [
-        {"name": "PGPASSWORD", "value": db_pass},
-        {"name": "SQL_URL",    "value": sql_url},
-        {"name": "DB_HOST",    "value": db_host},
-        {"name": "DB_USER",    "value": db_user},
+        {"name": "FLYWAY_PASSWORD", "value": db_pass},
+        {"name": "SQL_URL",         "value": sql_url},
+        {"name": "DB_HOST",         "value": db_host},
+        {"name": "DB_USER",         "value": db_user},
     ],
     "logConfiguration": {
         "logDriver": "awslogs",
         "options": {
-            "awslogs-group":         f"/ecs/navigator-{env}-bootstrap",
+            "awslogs-group":         f"/ecs/navigator-{env}-migrate",
             "awslogs-region":        region,
-            "awslogs-stream-prefix": "bootstrap",
+            "awslogs-stream-prefix": "migrate",
         }
     }
 }]))
@@ -184,7 +227,7 @@ PYEOF
 
 echo "==> Registering task definition..."
 TASK_DEF_ARN=$(aws ecs register-task-definition --region "$REGION" \
-  --family "navigator-${ENV}-db-bootstrap" \
+  --family "navigator-${ENV}-db-migrate" \
   --network-mode awsvpc \
   --requires-compatibilities FARGATE \
   --cpu "512" --memory "1024" \
@@ -193,13 +236,13 @@ TASK_DEF_ARN=$(aws ecs register-task-definition --region "$REGION" \
   --container-definitions "$CONTAINER_DEFS" \
   --query "taskDefinition.taskDefinitionArn" --output text)
 
-echo "==> Running bootstrap task..."
+echo "==> Running Flyway task..."
 RUN_OUT=$(aws ecs run-task --region "$REGION" \
   --cluster "$TEMP_CLUSTER" \
   --task-definition "$TASK_DEF_ARN" \
   --launch-type FARGATE \
   --network-configuration \
-    "awsvpcConfiguration={subnets=[$SUBNET_ID],securityGroups=[$BOOTSTRAP_SG],assignPublicIp=ENABLED}" \
+    "awsvpcConfiguration={subnets=[$SUBNET_ID],securityGroups=[$MIGRATE_SG],assignPublicIp=ENABLED}" \
   --output json)
 
 TASK_ARN=$(echo "$RUN_OUT" | python3 -c \
@@ -213,7 +256,7 @@ if [ -z "$TASK_ARN" ]; then
 fi
 
 echo "    Task: $TASK_ARN"
-echo "==> Waiting for bootstrap to complete..."
+echo "==> Waiting for Flyway to complete..."
 aws ecs wait tasks-stopped --region "$REGION" --cluster "$TEMP_CLUSTER" --tasks "$TASK_ARN"
 
 EXIT_CODE=$(aws ecs describe-tasks --region "$REGION" \
@@ -221,10 +264,9 @@ EXIT_CODE=$(aws ecs describe-tasks --region "$REGION" \
   --query "tasks[0].containers[0].exitCode" --output text)
 
 if [ "$EXIT_CODE" = "0" ]; then
-  echo "==> Bootstrap completed successfully."
-  echo "    service_snapshots table is ready — run the ingestion pipeline to populate it."
+  echo "==> Flyway $FLYWAY_CMD completed successfully."
 else
-  echo "==> Bootstrap FAILED (exit code: $EXIT_CODE)."
-  echo "    Stream logs with: aws logs tail /ecs/navigator-${ENV}-bootstrap --region $REGION --follow"
+  echo "==> Flyway FAILED (exit code: $EXIT_CODE)."
+  echo "    Stream logs with: aws logs tail /ecs/navigator-${ENV}-migrate --region $REGION --follow"
   exit 1
 fi
