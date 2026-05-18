@@ -73,6 +73,11 @@ class AgentStack(Stack):
             Path(__file__).parent / "observability" / "collector-config.yaml"
         ).read_text()
 
+        otel_collector_repo = ecr.Repository.from_repository_name(
+            self, "OtelCollectorRepo",
+            repository_name="otel-collector-contrib",
+        )
+
         task_def.add_container("agent",
             image=agent_image,
             port_mappings=[ecs.PortMapping(container_port=3000)],
@@ -102,9 +107,8 @@ class AgentStack(Stack):
         )
 
         task_def.add_container("adot-collector",
-            image=ecs.ContainerImage.from_registry(
-                "public.ecr.aws/aws-observability/aws-otel-collector:v0.43.0"
-            ),
+            image=ecs.ContainerImage.from_ecr_repository(otel_collector_repo, "0.114.0"),
+            command=["--config=env:AOT_CONFIG_CONTENT"],
             essential=False,
             logging=ecs.LogDrivers.aws_logs(stream_prefix=f"navigator-{env_name}-adot"),
             environment={
@@ -122,6 +126,7 @@ class AgentStack(Stack):
         )
 
         chatapi_repo.grant_pull(task_def.execution_role)
+        otel_collector_repo.grant_pull(task_def.execution_role)
         anthropic_secret.grant_read(task_def.task_role)
         db_secret.grant_read(task_def.task_role)
         observability_secret.grant_read(task_def.task_role)

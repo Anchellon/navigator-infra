@@ -56,6 +56,11 @@ class McpStack(Stack):
             Path(__file__).parent / "observability" / "collector-config.yaml"
         ).read_text()
 
+        otel_collector_repo = ecr.Repository.from_repository_name(
+            self, "OtelCollectorRepo",
+            repository_name="otel-collector-contrib",
+        )
+
         task_def.add_container("mcp-server",
             image=ecs.ContainerImage.from_ecr_repository(mcp_repo),
             memory_limit_mib=1024,
@@ -77,9 +82,8 @@ class McpStack(Stack):
         )
 
         task_def.add_container("adot-collector",
-            image=ecs.ContainerImage.from_registry(
-                "public.ecr.aws/aws-observability/aws-otel-collector:v0.43.0"
-            ),
+            image=ecs.ContainerImage.from_ecr_repository(otel_collector_repo, "0.114.0"),
+            command=["--config=env:AOT_CONFIG_CONTENT"],
             essential=False,
             logging=ecs.LogDrivers.aws_logs(stream_prefix=f"navigator-{env_name}-mcp-adot"),
             environment={
@@ -104,6 +108,7 @@ class McpStack(Stack):
         ))
 
         mcp_repo.grant_pull(task_def.execution_role)
+        otel_collector_repo.grant_pull(task_def.execution_role)
         db_secret.grant_read(task_def.task_role)
         observability_secret.grant_read(task_def.task_role)
 
