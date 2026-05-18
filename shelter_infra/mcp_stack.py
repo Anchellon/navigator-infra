@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import aws_cdk as cdk
 from aws_cdk import (
     Stack,
@@ -27,6 +29,14 @@ class McpStack(Stack):
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
+        # Must be pre-created: aws secretsmanager create-secret \
+        #   --name navigator/{env_name}/observability-keys \
+        #   --secret-string '{"GRAFANA_TOKEN":"...","LANGFUSE_PUBLIC_KEY":"...","LANGFUSE_SECRET_KEY":"...","SENTRY_DSN_CHAT_API":"...","SENTRY_DSN_MCP_SERVER":"...","SENTRY_DSN_FRONTEND":"..."}'
+        observability_secret = secretsmanager.Secret.from_secret_name_v2(
+            self, "ObservabilitySecret",
+            secret_name=f"navigator/{env_name}/observability-keys",
+        )
+
         self.namespace = servicediscovery.PrivateDnsNamespace(self, "Namespace",
             name=f"navigator-{env_name}.internal",
             vpc=vpc,
@@ -41,6 +51,10 @@ class McpStack(Stack):
             cpu=512,
             memory_limit_mib=1024,
         )
+
+        collector_yaml = (
+            Path(__file__).parent / "observability" / "collector-config.yaml"
+        ).read_text()
 
         task_def.add_container("mcp-server",
             image=ecs.ContainerImage.from_ecr_repository(mcp_repo),
@@ -62,6 +76,26 @@ class McpStack(Stack):
             },
         )
 
+        task_def.add_container("adot-collector",
+            image=ecs.ContainerImage.from_registry(
+                "public.ecr.aws/aws-observability/aws-otel-collector:v0.43.0"
+            ),
+            essential=False,
+            logging=ecs.LogDrivers.aws_logs(stream_prefix=f"navigator-{env_name}-mcp-adot"),
+            environment={
+                "AOT_CONFIG_CONTENT": collector_yaml,
+                "GRAFANA_OTLP_ENDPOINT": "https://otlp-gateway-prod-us-east-3.grafana.net/otlp",
+                "GRAFANA_INSTANCE_ID": "1642287",
+                "LANGFUSE_OTLP_ENDPOINT": "https://us.cloud.langfuse.com/api/public/otel",
+                "SERVICE_NAME": "shelter-mcp-server",
+            },
+            secrets={
+                "GRAFANA_TOKEN": ecs.Secret.from_secrets_manager(observability_secret, "GRAFANA_TOKEN"),
+                "LANGFUSE_PUBLIC_KEY": ecs.Secret.from_secrets_manager(observability_secret, "LANGFUSE_PUBLIC_KEY"),
+                "LANGFUSE_SECRET_KEY": ecs.Secret.from_secrets_manager(observability_secret, "LANGFUSE_SECRET_KEY"),
+            },
+        )
+
         task_def.task_role.add_to_policy(iam.PolicyStatement(
             actions=["bedrock:InvokeModel"],
             resources=[
@@ -71,6 +105,7 @@ class McpStack(Stack):
 
         mcp_repo.grant_pull(task_def.execution_role)
         db_secret.grant_read(task_def.task_role)
+        observability_secret.grant_read(task_def.task_role)
 
         mcp_sg = ec2.SecurityGroup(self, "McpSG",
             vpc=vpc,

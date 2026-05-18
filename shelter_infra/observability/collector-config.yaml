@@ -1,0 +1,75 @@
+# Source of truth: this file in git. Delivered to ADOT sidecar via AOT_CONFIG_CONTENT
+# env var at cdk synth time. Edit + cdk deploy to apply changes.
+
+extensions:
+  basicauth/grafana_cloud:
+    client_auth:
+      username: ${env:GRAFANA_INSTANCE_ID}
+      password: ${env:GRAFANA_TOKEN}
+
+  basicauth/langfuse:
+    client_auth:
+      username: ${env:LANGFUSE_PUBLIC_KEY}
+      password: ${env:LANGFUSE_SECRET_KEY}
+
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+  awsecscontainermetrics:
+    collection_interval: 30s
+
+processors:
+  resource:
+    attributes:
+      # service.name uses `insert` so app-emitted resource attributes win in Phase 5
+      - key: service.name
+        value: ${env:SERVICE_NAME}
+        action: insert
+      - key: deployment.environment
+        value: staging
+        action: upsert
+
+  batch:
+    timeout: 10s
+    send_batch_size: 1024
+
+exporters:
+  otlphttp/grafana_cloud:
+    endpoint: ${env:GRAFANA_OTLP_ENDPOINT}
+    auth:
+      authenticator: basicauth/grafana_cloud
+
+  otlphttp/langfuse:
+    endpoint: ${env:LANGFUSE_OTLP_ENDPOINT}
+    auth:
+      authenticator: basicauth/langfuse
+
+service:
+  extensions: [basicauth/grafana_cloud, basicauth/langfuse, health_check]
+
+  pipelines:
+    # Traces fan out: everything to Grafana (system-wide tracing) + Langfuse (LLM-specific).
+    # Filtering for LLM-only spans can be added when general OTel SDK instrumentation
+    # lands in Phase 5 — until then, all traces are LLM-related.
+    traces:
+      receivers: [otlp]
+      processors: [resource, batch]
+      exporters: [otlphttp/grafana_cloud, otlphttp/langfuse]
+
+    metrics:
+      receivers: [otlp, awsecscontainermetrics]
+      processors: [resource, batch]
+      exporters: [otlphttp/grafana_cloud]
+
+    logs:
+      receivers: [otlp]
+      processors: [resource, batch]
+      exporters: [otlphttp/grafana_cloud]
