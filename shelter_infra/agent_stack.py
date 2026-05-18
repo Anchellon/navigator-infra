@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import aws_cdk as cdk
 from aws_cdk import (
     CfnOutput,
@@ -43,6 +45,14 @@ class AgentStack(Stack):
             secret_name=f"navigator/{env_name}/anthropic-api-key",
         )
 
+        # Must be pre-created: aws secretsmanager create-secret \
+        #   --name navigator/{env_name}/observability-keys \
+        #   --secret-string '{"GRAFANA_TOKEN":"...","LANGFUSE_PUBLIC_KEY":"...","LANGFUSE_SECRET_KEY":"...","SENTRY_DSN_CHAT_API":"...","SENTRY_DSN_MCP_SERVER":"...","SENTRY_DSN_FRONTEND":"..."}'
+        observability_secret = secretsmanager.Secret.from_secret_name_v2(
+            self, "ObservabilitySecret",
+            secret_name=f"navigator/{env_name}/observability-keys",
+        )
+
         cluster = ecs.Cluster(self, "Cluster",
             vpc=vpc,
             cluster_name=f"navigator-{env_name}-agent",
@@ -58,6 +68,10 @@ class AgentStack(Stack):
         cors_origins = "http://localhost:5173"
         if frontend_origin:
             cors_origins = f"http://localhost:5173,{frontend_origin}"
+
+        collector_yaml = (
+            Path(__file__).parent / "observability" / "collector-config.yaml"
+        ).read_text()
 
         task_def.add_container("agent",
             image=agent_image,
@@ -87,9 +101,30 @@ class AgentStack(Stack):
             },
         )
 
+        task_def.add_container("adot-collector",
+            image=ecs.ContainerImage.from_registry(
+                "public.ecr.aws/aws-observability/aws-otel-collector:v0.43.0"
+            ),
+            essential=False,
+            logging=ecs.LogDrivers.aws_logs(stream_prefix=f"navigator-{env_name}-adot"),
+            environment={
+                "AOT_CONFIG_CONTENT": collector_yaml,
+                "GRAFANA_OTLP_ENDPOINT": "https://otlp-gateway-prod-us-east-3.grafana.net/otlp",
+                "GRAFANA_INSTANCE_ID": "1642287",
+                "LANGFUSE_OTLP_ENDPOINT": "https://us.cloud.langfuse.com/api/public/otel",
+                "SERVICE_NAME": "shelter-chat-api",
+            },
+            secrets={
+                "GRAFANA_TOKEN": ecs.Secret.from_secrets_manager(observability_secret, "GRAFANA_TOKEN"),
+                "LANGFUSE_PUBLIC_KEY": ecs.Secret.from_secrets_manager(observability_secret, "LANGFUSE_PUBLIC_KEY"),
+                "LANGFUSE_SECRET_KEY": ecs.Secret.from_secrets_manager(observability_secret, "LANGFUSE_SECRET_KEY"),
+            },
+        )
+
         chatapi_repo.grant_pull(task_def.execution_role)
         anthropic_secret.grant_read(task_def.task_role)
         db_secret.grant_read(task_def.task_role)
+        observability_secret.grant_read(task_def.task_role)
 
         alb_sg = ec2.SecurityGroup(self, "AlbSG",
             vpc=vpc,
